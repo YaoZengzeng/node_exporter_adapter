@@ -8,11 +8,26 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
+	"time"
+
+	apiv1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 )
 
+const resyncPeriod = 10 * time.Minute
+
+var node string
+
 func main() {
+	node = os.Getenv("NODE")
 	buf := &bytes.Buffer{}
 	err := getMetrics(buf)
 	if err != nil {
@@ -101,8 +116,39 @@ func getMetrics(w io.Writer) error {
 }
 
 func getNodeLabels() (map[string]string, error) {
-	return map[string]string{
-		"k1": "v1",
-		"k2": "v2",
-	}, nil
+	kcfg, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+	client, err := kubernetes.NewForConfig(kcfg)
+	if err != nil {
+		return nil, err
+	}
+
+	nlw := &cache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return client.CoreV1().Nodes().List(options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			return client.CoreV1().Nodes().Watch(options)
+		},
+	}
+
+	informer := cache.NewSharedInformer(nlw, &apiv1.Node{}, resyncPeriod)
+	store := informer.GetStore()
+
+	o, exists, err := store.GetByKey(node)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, fmt.Errorf("can't find node %v in the informer store", node)
+	}
+
+	node, ok := o.(*apiv1.Node)
+	if !ok {
+		return nil, fmt.Errorf("received object which is not node type")
+	}
+
+	return node.Labels, nil
 }

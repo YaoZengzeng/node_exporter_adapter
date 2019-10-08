@@ -1,0 +1,25 @@
+apiVersion: extensions/v1beta1
+kind: DaemonSet
+metadata:
+  name: node-exporter-adapter
+spec:
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: '9101'
+      labels:
+        app: node-exporter-adapter
+      name: node-exporter-adapter
+    spec:
+      serviceAccountName: node-exporter-adapter
+      containers:
+      - image: node-exporter-adapter:v0.1.0
+        imagePullPolicy: IfNotPresent
+        name: node-exporter-adapter
+        ports:
+        - containerPort: 9101
+          hostPort: 9101
+          name: scrape
+      hostNetwork: true
+

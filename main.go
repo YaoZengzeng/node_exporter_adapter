@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -67,6 +68,8 @@ func main() {
 	}
 
 	fmt.Println(res.String())
+
+	time.Sleep(10 * time.Hour)
 }
 
 func appendNodeLabels(line string, labels map[string]string) (string, error) {
@@ -136,6 +139,13 @@ func getNodeLabels() (map[string]string, error) {
 
 	informer := cache.NewSharedInformer(nlw, &apiv1.Node{}, resyncPeriod)
 	store := informer.GetStore()
+
+	ctx := context.Background()
+	go informer.Run(ctx.Done())
+
+	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
+		return nil, fmt.Errorf("failed to sync cache")
+	}
 
 	o, exists, err := store.GetByKey(node)
 	if err != nil {

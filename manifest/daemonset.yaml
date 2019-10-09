@@ -21,5 +21,10 @@ spec:
         - containerPort: 9101
           hostPort: 9101
           name: scrape
+        env:
+          - name: NODE
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
       hostNetwork: true
 

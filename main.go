@@ -4,13 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,9 +32,22 @@ const (
 	healthzPath  = "/healthz"
 )
 
-var node string
+var (
+	node             string
+	host             string
+	port             int
+	nodeExporterPort int
+)
+
+func init() {
+	flag.StringVar(&host, "host", "0.0.0.0", "Host to expose metrics on")
+	flag.IntVar(&port, "port", 9101, "Port to expose metrics on")
+	flag.IntVar(&nodeExporterPort, "node-exporter-port", 9100, "Port which node-exporter to expose metrics on")
+}
 
 func main() {
+	flag.Parse()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -48,100 +64,13 @@ func main() {
 		w.Write([]byte(http.StatusText(http.StatusOK)))
 	})
 
-	log.Fatal(http.ListenAndServe(":9101", mux))
+	listenAddress := net.JoinHostPort(host, strconv.Itoa(port))
+	log.Fatal(http.ListenAndServe(listenAddress, mux))
 }
 
 type MetricsHandler struct {
 	node  string
 	store cache.Store
-}
-
-func (m *MetricsHandler) NodeLabels() (map[string]string, error) {
-	o, exists, err := m.store.GetByKey(m.node)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, fmt.Errorf("can't find node %v in the store", node)
-	}
-
-	node, ok := o.(*apiv1.Node)
-	if !ok {
-		return nil, fmt.Errorf("received object which is not node type")
-	}
-
-	return node.Labels, nil
-}
-
-func (m *MetricsHandler) GetMetrics(w io.Writer) error {
-	resp, err := http.Get("http://localhost:9100/metrics")
-	if err != nil {
-		return err
-	}
-	defer func() {
-		io.Copy(ioutil.Discard, resp.Body)
-		resp.Body.Close()
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("node exporter returned HTTP status %s", resp.Status)
-	}
-
-	io.Copy(w, resp.Body)
-
-	return nil
-}
-
-func (m *MetricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	resHeader := w.Header()
-	resHeader.Set("Content-Type", `text/plain; version=`+"0.0.4")
-
-	buf := &bytes.Buffer{}
-	err := m.GetMetrics(buf)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to get metrics from node exporter: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	labels, err := m.NodeLabels()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to get node labels: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	res := &bytes.Buffer{}
-	scanner := bufio.NewScanner(buf)
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Skip comments.
-		if !strings.Contains(line, "#") {
-			line, err = appendNodeLabels(line, labels)
-			if err != nil {
-				http.Error(w, fmt.Sprintf("failed to append node labels to metric: %v", err), http.StatusInternalServerError)
-				return
-			}
-		}
-
-		n, err := res.WriteString(line + "\n")
-		if err != nil {
-			http.Error(w, fmt.Sprintf("write line to buffer failed: %v", err), http.StatusInternalServerError)
-			return
-		}
-		if n != (len(line) + 1) {
-			http.Error(w, fmt.Sprintf("expect to write %v bytes into buffer, but actually write %v", len(line)+1, n), http.StatusInternalServerError)
-			return
-		}
-	}
-
-	err = scanner.Err()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("scan metrics failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write(res.Bytes())
 }
 
 func NewMetricsHandler(ctx context.Context) (*MetricsHandler, error) {
@@ -181,6 +110,106 @@ func NewMetricsHandler(ctx context.Context) (*MetricsHandler, error) {
 		node:  node,
 		store: store,
 	}, nil
+}
+
+func (m *MetricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	resHeader := w.Header()
+	resHeader.Set("Content-Type", `text/plain; version=`+"0.0.4")
+
+	buf := &bytes.Buffer{}
+	err := m.GetMetrics(buf)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get metrics from node exporter: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	labels, err := m.NodeLabels()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get node labels: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	skip := false
+	res := &bytes.Buffer{}
+	scanner := bufio.NewScanner(buf)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Skip comments.
+		if !strings.Contains(line, "#") {
+			if !skip {
+				line, err = appendNodeLabels(line, labels)
+				if err != nil {
+					http.Error(w, fmt.Sprintf("failed to append node labels to metric: %v", err), http.StatusInternalServerError)
+					return
+				}
+			}
+		} else {
+			if strings.Contains(line, "TYPE") {
+				if strings.Contains(line, "summary") || strings.Contains(line, "histogram") {
+					// Avoid to add node labels to metrics of type Summary and Histogram.
+					skip = true
+				} else {
+					skip = false
+				}
+			}
+		}
+
+		n, err := res.WriteString(line + "\n")
+		if err != nil {
+			http.Error(w, fmt.Sprintf("write line to buffer failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if n != (len(line) + 1) {
+			http.Error(w, fmt.Sprintf("expect to write %v bytes into buffer, but actually write %v", len(line)+1, n), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	err = scanner.Err()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("scan metrics failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write(res.Bytes())
+}
+
+func (m *MetricsHandler) NodeLabels() (map[string]string, error) {
+	o, exists, err := m.store.GetByKey(m.node)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, fmt.Errorf("can't find node %v in the store", node)
+	}
+
+	node, ok := o.(*apiv1.Node)
+	if !ok {
+		return nil, fmt.Errorf("received object which is not node type")
+	}
+
+	return node.Labels, nil
+}
+
+func (m *MetricsHandler) GetMetrics(w io.Writer) error {
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%s/metrics", strconv.Itoa(nodeExporterPort)))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		io.Copy(ioutil.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("node exporter returned HTTP status %s", resp.Status)
+	}
+
+	io.Copy(w, resp.Body)
+
+	return nil
 }
 
 func appendNodeLabels(line string, labels map[string]string) (string, error) {

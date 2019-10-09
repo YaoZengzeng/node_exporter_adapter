@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -190,7 +191,23 @@ func (m *MetricsHandler) NodeLabels() (map[string]string, error) {
 		return nil, fmt.Errorf("received object which is not node type")
 	}
 
-	return node.Labels, nil
+	res := map[string]string{
+		"node": m.node,
+	}
+
+	// The valid character set of the label of k8s and prometheus is different.
+	// So filter the invalid labels.
+	for k, v := range node.Labels {
+		match, err := regexp.MatchString("[^a-zA-Z0-9_]", k)
+		if err != nil {
+			return nil, fmt.Errorf("match valid pattern of prometheus label failed: %v", err)
+		}
+		if !match {
+			res[k] = v
+		}
+	}
+
+	return res, nil
 }
 
 func (m *MetricsHandler) GetMetrics(w io.Writer) error {
